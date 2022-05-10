@@ -1,0 +1,198 @@
+---
+title: "analysis"
+author: "Will Schrepferman"
+date: "5/9/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(janitor)
+library(stringdist)
+library(ggpubr)
+```
+
+
+```{r read_data}
+# read DIME data
+indiana_donations_14 <- read_csv("data/in_conts2014.csv") %>%
+  clean_names() %>%
+  mutate(zip = as.double(substr(contributor_zipcode, 1, 5)))
+
+indiana_donations_12 <- read_csv("data/in_conts2012.csv") %>%
+  clean_names() %>%
+  mutate(zip = as.double(substr(contributor_zipcode, 1, 5)))
+
+# read Zip Code data
+
+indiana_zips <- read_csv("data/county_zip.csv")
+
+# match zip codes (present in DIME) to counties (not present originally in DIME)
+
+indiana_donations_14 <- left_join(indiana_donations_14, indiana_zips, by = "zip")
+
+indiana_donations_12 <- left_join(indiana_donations_12, indiana_zips, by = "zip")
+
+
+# make full first_last name
+
+indiana_donations_14 <- indiana_donations_14 %>%
+  mutate(fullname = paste(contributor_fname, contributor_lname, sep = " ")) %>%
+  select(fullname, zip, county, contributor_cfscore)
+
+indiana_donations_12 <- indiana_donations_12 %>%
+  mutate(fullname = paste(contributor_fname, contributor_lname, sep = " ")) %>%
+  select(fullname, zip, county, contributor_cfscore)
+
+# remove data from counties that could not be scraped
+
+indiana_sb <- read_csv("data/2014sbmembers.csv") %>%
+  mutate(fullname = tolower(Results)) %>%
+  filter(fullname != "unavailable") %>%
+  select(fullname, District)
+
+# counties_analyzed <- unique(indiana_sb$District)
+
+elections <- read_csv("data/countypres_2000-2020.csv")
+
+
+```
+
+```{r baseline}
+
+# baseline cfscore for each county
+
+baseline_cf <- indiana_donations_12 %>%
+  group_by(county) %>%
+  drop_na() %>%
+  summarize(avg_cf = mean(contributor_cfscore, na.rm = TRUE)) %>%
+  select(county, avg_cf)
+
+# get electoral preferences by county from 2012
+
+elections_obama <- elections %>%
+  mutate(county = tolower(county_name)) %>%
+  filter(state_po == "IN", year == 2012) %>%
+  filter(candidate == "BARACK OBAMA") %>%
+  mutate(perc = candidatevotes / totalvotes) %>%
+  select(county, perc)
+         
+elections_romney <- elections %>%
+  mutate(county = tolower(county_name)) %>%
+  filter(state_po == "IN", year == 2012) %>%
+  filter(candidate == "MITT ROMNEY") %>%
+  mutate(perc = candidatevotes / totalvotes) %>%
+  select(county, perc)
+
+elect <- left_join(elections_romney, elections_obama, by = "county") %>%
+  mutate(diff = perc.x - perc.y) %>%
+  group_by(county) %>%
+  summarize(diff = diff) %>%
+  select(county, diff)
+
+
+baseline <- left_join(baseline_cf, elect, by = "county")
+
+baseline <- read_csv("data/baseline.csv")
+
+counties_analyzed <- c("blackford", "crawford", "fayette", "jennings", "pike", "owen", "union", "warren", "warrick")
+
+baseline <- baseline %>%
+  mutate(analyzed = ifelse(county %in% counties_analyzed, FALSE, TRUE)) %>%
+  drop_na()
+
+baseline %>%
+  ggplot(aes(x = diff, y = avg_cf, color = analyzed, group = 1)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", se=FALSE) +
+  stat_regline_equation(label.y = 0.55, aes(label = ..rr.label..)) +
+  theme(legend.position="none") +
+  labs(title = "2012 Indiana By-County Romney over Obama Margin versus CFScore", subtitle = "Counties Analyzed in Red", x = "Electoral Difference", y = "CF Score")
+```
+
+
+
+```{r match}
+
+# empty tibble to pass matched data
+
+matched_df <- tibble(
+  fullname_orig = character(),
+  fullname_matched = character(),
+  stringdist = numeric(),
+  district = character(),
+  county = character(),
+  cf_score = numeric()
+)
+
+# iterate through school board members, find nearest string match in cfscore database, combine relevant data
+
+for (i in 1:length(indiana_sb$fullname)){
+  index_match <- amatch(indiana_sb$fullname[i], indiana_donations_12$fullname, maxDist = 100)
+  
+  temp_fullname_orig <- indiana_sb$fullname[i]
+  temp_fullname_matched <- indiana_donations_12$fullname[index_match]
+  temp_stringdist <- stringdist(temp_fullname_orig, temp_fullname_matched)
+  temp_county <- indiana_donations_12$county[index_match]
+  temp_district <- indiana_sb$District[i]
+  temp_cf_score <- indiana_donations_12$contributor_cfscore[index_match]
+  
+  matched_df <- matched_df %>%
+    add_row(
+        fullname_orig = temp_fullname_orig,
+        fullname_matched = temp_fullname_matched,
+        stringdist = temp_stringdist,
+        district = temp_district,
+        county = temp_county,
+        cf_score = temp_cf_score
+    )
+}
+
+matched_df_final <- matched_df %>%
+  mutate(county = tolower(county))
+
+matched_df_final <- left_join(matched_df_final, baseline, by = "county")
+
+matched_df_final <- matched_df_final %>%
+  arrange(stringdist)
+
+write_csv(matched_df_final, "final_matches.csv")
+
+matched_df_final_selected <- read_csv("data/final_selected.csv") %>%
+  clean_names()
+
+matched_df_final_plt <- matched_df_final_selected %>%
+  ggplot(aes(x = county_average_cf_score, y = individual_cf_score)) +
+  geom_point() +
+  geom_smooth(method = "lm", se=FALSE) +
+  labs(title = "Individual School Board Member CF Scores versus County Averages")
+
+matched_df_final_plt2 <- matched_df_final_selected %>%
+  ggplot(aes(x = county_electoral_difference, y = individual_cf_score)) +
+  geom_point() +
+  geom_smooth(method = "lm", se=FALSE) +
+  labs(title = "Individual School Board Member CF Scores versus County Electoral Difference")
+  
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
